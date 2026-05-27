@@ -14,11 +14,185 @@ import java.util.function.Consumer;
 import static com.nobtg.agentMemoryInjection.jvm.AgentLayoutAccessors.*;
 import static com.nobtg.agentMemoryInjection.jvm.JNIConstants.*;
 import static com.nobtg.agentMemoryInjection.jvm.JPLISLayouts.*;
+import static com.nobtg.agentMemoryInjection.jvm.JPLISLayouts.Offsets.CAN_REDEFINE_CLASSES;
+import static com.nobtg.agentMemoryInjection.jvm.JPLISLayouts.Offsets.CAN_SET_NATIVE_METHOD_PREFIX;
 import static java.lang.foreign.ValueLayout.*;
 
 public final class PanamaPureMemoryAgent {
     public static Instrumentation instrumentation;
     private static final boolean DEBUG = false;
+
+    //    _JNI_IMPORT_OR_EXPORT_ jint JNICALL
+//    JNI_GetCreatedJavaVMs(JavaVM **, jsize, jsize *);
+    private static MemorySegment getJavaVMPtr(@NotNull Arena arena, @NotNull Linker linker, @NotNull SymbolLookup jvmDllLookup) throws Throwable {
+        MemorySegment jniGetVM = jvmDllLookup.find("JNI_GetCreatedJavaVMs")
+                .orElseThrow(() -> new RuntimeException("Could not find symbol: JNI_GetCreatedJavaVMs"));
+
+        MethodHandle getCreatedVMs = linker.downcallHandle(jniGetVM,
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ValueLayout.JAVA_INT, ADDRESS));
+
+        MemorySegment vmBuffer = arena.allocate(ADDRESS);
+        MemorySegment nVMs = arena.allocate(ValueLayout.JAVA_INT);
+
+        if ((int) getCreatedVMs.invokeExact(vmBuffer, 1, nVMs) != 0) {
+            throw new RuntimeException("Failed to acquire JavaVM* pointer!");
+        }
+
+        if (nVMs.get(JAVA_INT, 0) != 1) {
+            throw new RuntimeException("Why you get not only one but also another JVM??");
+        }
+
+        return vmBuffer.get(ADDRESS, 0).reinterpret(ADDRESS.byteSize());
+    }
+
+    private static MemorySegment allocateJPLISAgent(@NotNull Arena arena, MemorySegment jvmTiEnv, MemorySegment jvmTiVtable) throws Throwable {
+        MethodHandle allocateHandle = findMethod(JVMTI_INTERFACE_LAYOUT, "Allocate", jvmTiVtable,
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ValueLayout.JAVA_LONG, ADDRESS));
+
+        long agentStructSize = JPLIS_AGENT_LAYOUT.byteSize();
+        MemorySegment pPtr = arena.allocate(ADDRESS);
+        int allocateAgentResult = (int) allocateHandle.invokeExact(jvmTiEnv, agentStructSize, pPtr);
+        if (allocateAgentResult != JVMTI_ERROR_NONE) {
+            System.err.println("Allocate(allocateAgent) 操作失敗: " + JNIConstants.getJvmtiErrorMessage(allocateAgentResult));
+        }
+
+        return pPtr.get(ADDRESS, 0).reinterpret(agentStructSize);
+    }
+
+    private static void initializeJPLISAgent(@NotNull Arena arena, MemorySegment javaVM, MemorySegment jvmTiEnv, MemorySegment jvmTiVTable
+            , @NotNull MemorySegment agentPtr, MemorySegment agentMNormalEnvironment, MemorySegment agentMRetransformEnvironment) throws Throwable {
+        agentPtr.fill((byte) 0);
+
+        mJVM.set(agentPtr, 0L, javaVM);
+
+        mJVMTIEnv.set(agentMNormalEnvironment, 0L, jvmTiEnv);
+        mAgent.set(agentMNormalEnvironment, 0L, agentPtr);
+        mIsRetransformer.set(agentMNormalEnvironment, 0L, false);
+
+        mJVMTIEnv.set(agentMRetransformEnvironment, 0L, MemorySegment.NULL);
+        mAgent.set(agentMRetransformEnvironment, 0L, agentPtr);
+        mIsRetransformer.set(agentMRetransformEnvironment, 0L, false);
+
+        mAgentmainCaller.set(agentPtr, 0L, MemorySegment.NULL);
+        mInstrumentationImpl.set(agentPtr, 0L, MemorySegment.NULL);
+        mPremainCaller.set(agentPtr, 0L, MemorySegment.NULL);
+        mTransform.set(agentPtr, 0L, MemorySegment.NULL);
+        mRedefineAvailable.set(agentPtr, 0L, false);
+        mRedefineAdded.set(agentPtr, 0L, false);
+        mNativeMethodPrefixAvailable.set(agentPtr, 0L, false);
+        mNativeMethodPrefixAdded.set(agentPtr, 0L, false);
+        mAgentClassName.set(agentPtr, 0L, MemorySegment.NULL);
+        mOptionsString.set(agentPtr, 0L, MemorySegment.NULL);
+
+        MemorySegment persistentJarPath = arena.allocateFrom("");
+        mJarfile.set(agentPtr, 0L, persistentJarPath);
+        mPrintWarning.set(agentPtr, 0L, false);
+
+        setEnvironmentLocalStorageHandle(jvmTiEnv, jvmTiVTable, agentMNormalEnvironment);
+        checkCapabilities(arena, jvmTiEnv, jvmTiVTable, agentPtr);
+
+        MemorySegment phasePtr = arena.allocate(JVMTI_PHASE_LAYOUT);
+        getPhase(jvmTiEnv, jvmTiVTable, phasePtr);
+        int phase = phasePtr.get(JAVA_INT, 0);
+        if (phase == JVMTI_PHASE_LIVE) {
+            System.err.println("JPLIS_INIT_ERROR_NONE");
+        } else if (phase != JVMTI_PHASE_ONLOAD) {
+            /* called too early or called too late; either way bail out */
+            System.err.println("JPLIS_INIT_ERROR_FAILURE");
+        }
+
+        // Following in VMInit...
+        // But I don't want to write that
+        // It doesn't matter because we're after the init phrase.
+    }
+
+    private static void setEnvironmentLocalStorageHandle(MemorySegment jvmTiEnv, MemorySegment jvmTiVtable, MemorySegment environment) throws Throwable {
+        MethodHandle setEnvironmentLocalStorageHandle =
+                findMethod(JVMTI_INTERFACE_LAYOUT, "SetEnvironmentLocalStorage", jvmTiVtable,
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ADDRESS));
+
+        int setEnvironmentLocalStorageResult = (int) setEnvironmentLocalStorageHandle.invokeExact(jvmTiEnv, environment);
+        if (setEnvironmentLocalStorageResult != JVMTI_ERROR_NONE) {
+            System.err.println("SetEnvironmentLocalStorage 操作失敗: " + JNIConstants.getJvmtiErrorMessage(setEnvironmentLocalStorageResult));
+        }
+    }
+
+    private static MemorySegment getJNIEnv(@NotNull Arena arena, MemorySegment javaVM, @NotNull MethodHandle getEnvHandle) throws Throwable {
+        MemorySegment pEnv = arena.allocate(ADDRESS);
+        int getJNIResult = (int) getEnvHandle.invokeExact(javaVM, pEnv, JNI_VERSION_1_2);
+        if (getJNIResult != JNIConstants.JNI_OK) {
+            System.err.println("GetEnv(getJNIEnv) 操作失敗: " + JNIConstants.getStatusMessage(getJNIResult));
+        }
+        return pEnv.get(ADDRESS, 0).reinterpret(ADDRESS.byteSize());
+    }
+
+    private static int getPotentialCapabilities(MemorySegment jvmTiEnv, MemorySegment jvmTiVtable, MemorySegment potentialCapabilities) throws Throwable {
+        MethodHandle getPotentialCapabilitiesHandle =
+                findMethod(JVMTI_INTERFACE_LAYOUT, "GetPotentialCapabilities", jvmTiVtable,
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ADDRESS));
+
+        return (int) getPotentialCapabilitiesHandle.invokeExact(jvmTiEnv, potentialCapabilities);
+    }
+
+    private static void checkCapabilities(@NotNull Arena arena, MemorySegment jvmTiEnv, MemorySegment jvmTiVtable, MemorySegment agentPtr) throws Throwable {
+        MemorySegment potentialCapabilities = arena.allocate(JVMTI_CAPABILITIES_LAYOUT);
+        potentialCapabilities.fill((byte) 0);
+
+        int getPotentialCapabilitiesResult = getPotentialCapabilities(jvmTiEnv, jvmTiVtable, potentialCapabilities);
+        // check_phase_ret
+        if (getPotentialCapabilitiesResult == JVMTI_ERROR_WRONG_PHASE) {
+            return;
+        }
+        if (getPotentialCapabilitiesResult != JVMTI_ERROR_NONE) {
+            System.err.println("SetEnvironmentLocalStorage 操作失敗: " + JNIConstants.getJvmtiErrorMessage(getPotentialCapabilitiesResult));
+        }
+
+        if (getBit(potentialCapabilities, CAN_REDEFINE_CLASSES)) {
+            mRedefineAvailable.set(agentPtr, 0L, true);
+        } else {
+            System.err.println("JVM Unsupported Redefine Classes.");
+        }
+
+        if (getBit(potentialCapabilities, CAN_SET_NATIVE_METHOD_PREFIX)) {
+            mNativeMethodPrefixAvailable.set(agentPtr, 0L, true);
+        } else {
+            System.err.println("JVM Unsupported Set Native Method Prefix.");
+        }
+    }
+
+    private static void getPhase(MemorySegment jvmTiEnv, MemorySegment jvmTiVtable, MemorySegment phrase) throws Throwable {
+        MethodHandle getPhaseHandle =
+                findMethod(JVMTI_INTERFACE_LAYOUT, "GetPhase", jvmTiVtable,
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ADDRESS));
+
+        int getPhaseResult = (int) getPhaseHandle.invokeExact(jvmTiEnv, phrase);
+        if (getPhaseResult != JVMTI_ERROR_NONE) {
+            System.err.println("getPhaseHandle 操作失敗: " + JNIConstants.getJvmtiErrorMessage(getPhaseResult));
+        }
+    }
+
+    private static void convertCapabilityAttributes(Arena arena, MemorySegment jvmTiEnv, MemorySegment agentPtr
+            , MethodHandle getCapabilitiesHandle, MethodHandle addCapabilitiesHandle) throws Throwable {
+        addRedefineClassesCapability(arena, jvmTiEnv, agentPtr, getCapabilitiesHandle, addCapabilitiesHandle);
+    }
+
+    private static void addRedefineClassesCapability(Arena arena, MemorySegment jvmTiEnv, MemorySegment agentPtr
+            , MethodHandle getCapabilitiesHandle, MethodHandle addCapabilitiesHandle) throws Throwable {
+        boolean redefineAvailable = (boolean) mRedefineAvailable.get(agentPtr, 0L);
+        boolean redefineAdded = (boolean) mRedefineAdded.get(agentPtr, 0L);
+        if (!redefineAvailable || redefineAdded) return;
+
+        int addCapabilitiesResult = addCap(arena, getCapabilitiesHandle, addCapabilitiesHandle, jvmTiEnv,
+                capabilities -> setBit(capabilities, CAN_REDEFINE_CLASSES, true)
+        );
+
+        if (addCapabilitiesResult == JVMTI_ERROR_WRONG_PHASE) return;
+        if (addCapabilitiesResult != JVMTI_ERROR_NONE) {
+            System.err.println("AddCapabilities 操作失敗: " + JNIConstants.getJvmtiErrorMessage(addCapabilitiesResult));
+        }
+
+        mRedefineAdded.set(agentPtr, 0L, true);
+    }
 
     public static void performInjection() throws Throwable {
         Linker linker = Linker.nativeLinker();
@@ -28,80 +202,20 @@ public final class PanamaPureMemoryAgent {
         try (Arena arena = Arena.ofConfined()) {
             SymbolLookup jvmLookup = SymbolLookup.libraryLookup(jvmPath, arena);
 
-            // Acquire JavaVM* pointer
-            MemorySegment jniGetVM = jvmLookup.find("JNI_GetCreatedJavaVMs")
-                    .orElseThrow(() -> new RuntimeException("Could not find symbol: JNI_GetCreatedJavaVMs"));
+            MemorySegment javaVM = getJavaVMPtr(arena, linker, jvmLookup);
+            MemorySegment javaVMFunctions = javaVM.get(ADDRESS, 0).reinterpret(JNI_INVOKE_INTERFACE_LAYOUT.byteSize());
 
-            MethodHandle getCreatedVMs = linker.downcallHandle(jniGetVM,
-                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ValueLayout.JAVA_INT, ADDRESS));
-
-            MemorySegment vmBuffer = arena.allocate(ADDRESS);
-            MemorySegment nVMs = arena.allocate(ValueLayout.JAVA_INT);
-
-            if ((int) getCreatedVMs.invokeExact(vmBuffer, 1, nVMs) != 0) {
-                throw new RuntimeException("Failed to acquire JavaVM* pointer!");
-            }
-            MemorySegment javaVM = vmBuffer.get(ADDRESS, 0);
-
-            MemorySegment vtableBase = javaVM.reinterpret(256).get(ADDRESS, 0);
-            MemorySegment vtable = vtableBase.reinterpret(256);
-
-            MethodHandle getEnvHandle = findMethod(JNI_INVOKE_INTERFACE_LAYOUT, "GetEnv", vtable,
+            MethodHandle getEnvHandle = findMethod(JNI_INVOKE_INTERFACE_LAYOUT, "GetEnv", javaVMFunctions,
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ADDRESS, ValueLayout.JAVA_INT));
-
-            MemorySegment jniEnvPtr = arena.allocate(ADDRESS);
-            int getJNIResult = (int) getEnvHandle.invokeExact(javaVM, jniEnvPtr, JNI_VERSION_1_2);
-            if (getJNIResult != JNIConstants.JNI_OK) {
-                System.err.println("GetEnv(getJNIEnv) 操作失敗: " + JNIConstants.getStatusMessage(getJNIResult));
-            }
 
             MemorySegment jvmTiEnv = createJvmTiEnv(arena, getEnvHandle, javaVM);
             MemorySegment jvmTiVtable = getJvmTiVtable(jvmTiEnv);
 
-            MethodHandle allocateHandle = findMethod(JVMTI_INTERFACE_LAYOUT, "Allocate", jvmTiVtable,
-                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ValueLayout.JAVA_LONG, ADDRESS));
+            MemorySegment agentPtr = allocateJPLISAgent(arena, jvmTiEnv, jvmTiVtable);
+            MemorySegment agentMNormalEnvironment = agentPtr.asSlice(mNormalEnvironment, JPLIS_ENVIRONMENT_LAYOUT.byteSize());
+            MemorySegment agentMRetransformEnvironment = agentPtr.asSlice(mRetransformEnvironment, JPLIS_ENVIRONMENT_LAYOUT.byteSize());
 
-            long size = JPLIS_AGENT_LAYOUT.byteSize();
-            MemorySegment memPtrPtr = arena.allocate(ADDRESS);
-            int allocateAgentResult = (int) allocateHandle.invokeExact(jvmTiEnv, size, memPtrPtr);
-            if (allocateAgentResult != JVMTI_ERROR_NONE) {
-                System.err.println("Allocate(allocateAgent) 操作失敗: " + JNIConstants.getJvmtiErrorMessage(allocateAgentResult));
-            }
-            long agentSize = JPLIS_AGENT_LAYOUT.byteSize();
-            MemorySegment agentPtr = memPtrPtr.get(ADDRESS, 0).reinterpret(agentSize);
-            agentPtr.fill((byte) 0);
-            if (agentPtr.address() == 0) {
-                System.err.println("???");
-            }
-
-            MemorySegment normalEnv = agentPtr.asSlice(AGENT_NORMAL_ENV_OFFSET, JPLIS_ENVIRONMENT_LAYOUT.byteSize());
-            ENV_JVMTI_VH.set(normalEnv, 0L, jvmTiEnv);
-            ENV_AGENT_VH.set(normalEnv, 0L, agentPtr);
-            ENV_RETRANS_VH.set(normalEnv, 0L, false);
-
-            MemorySegment retransEnv = agentPtr.asSlice(AGENT_RETRANS_ENV_OFFSET, JPLIS_ENVIRONMENT_LAYOUT.byteSize());
-            ENV_JVMTI_VH.set(retransEnv, 0L, MemorySegment.NULL);
-            ENV_AGENT_VH.set(retransEnv, 0L, agentPtr);
-            ENV_RETRANS_VH.set(retransEnv, 0L, false);
-
-            AGENT_JVM_VH.set(agentPtr, 0L, javaVM);
-            MemorySegment persistentJarPath = Arena.global().allocateFrom("");
-            AGENT_JAR_VH.set(agentPtr, 0L, persistentJarPath);
-            AGENT_PRINT_WARNING_VH.set(agentPtr, 0L, false);
-
-            MethodHandle setEnvironmentLocalStorageHandle =
-                    findMethod(JVMTI_INTERFACE_LAYOUT, "SetEnvironmentLocalStorage", jvmTiVtable,
-                            FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ADDRESS));
-
-            MemorySegment mNormalEnvironmentSegment = agentPtr.asSlice(AGENT_NORMAL_ENV_OFFSET, JPLIS_ENVIRONMENT_LAYOUT.byteSize());
-
-            int setEnvironmentLocalStorageResult = (int) setEnvironmentLocalStorageHandle.invokeExact(jvmTiEnv, mNormalEnvironmentSegment);
-            if (setEnvironmentLocalStorageResult != JVMTI_ERROR_NONE) {
-                System.err.println("SetEnvironmentLocalStorage 操作失敗: " + JNIConstants.getJvmtiErrorMessage(setEnvironmentLocalStorageResult));
-            }
-
-            AGENT_REDEFINE_AVAILABLE_VH.set(agentPtr, 0L, true);
-            AGENT_NATIVE_PREFIX_AVAILABLE_VH.set(agentPtr, 0L, true);
+            initializeJPLISAgent(arena, javaVM, jvmTiEnv, jvmTiVtable, agentPtr, agentMNormalEnvironment, agentMRetransformEnvironment);
 
             MethodHandle getCapabilitiesHandle =
                     findMethod(JVMTI_INTERFACE_LAYOUT, "GetCapabilities", jvmTiVtable,
@@ -111,15 +225,11 @@ public final class PanamaPureMemoryAgent {
                             findMethod(JVMTI_INTERFACE_LAYOUT, "AddCapabilities", jvmTiVtable,
                                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ADDRESS, ADDRESS));
 
-            addCap(arena, getCapabilitiesHandle, addCapabilitiesHandle, jvmTiEnv,
-                    capabilities -> setBit(capabilities, Offsets.CAN_REDEFINE_CLASSES, true)
-            );
-
-            AGENT_REDEFINE_ADDED_VH.set(agentPtr, 0L, true);
+            convertCapabilityAttributes(arena, jvmTiEnv, agentPtr, getCapabilitiesHandle, addCapabilitiesHandle);
 
             MemorySegment retransformerEnv = createJvmTiEnv(arena, getEnvHandle, javaVM);
             MemorySegment retransformerEnvVtable = getJvmTiVtable(retransformerEnv);
-            addCap(arena, getCapabilitiesHandle, addCapabilitiesHandle, retransformerEnv, capabilities ->  {
+            addCap(arena, getCapabilitiesHandle, addCapabilitiesHandle, retransformerEnv, capabilities -> {
                 setBit(capabilities, Offsets.CAN_RETRANSFORM_CLASSES, true);
                 setBit(capabilities, Offsets.CAN_SET_NATIVE_METHOD_PREFIX, true);
             });
@@ -152,14 +262,11 @@ public final class PanamaPureMemoryAgent {
                 System.err.println("SetEventCallbacks 操作失敗: " + JNIConstants.getJvmtiErrorMessage(setEventCallbacksResult));
             }
 
-            ENV_JVMTI_VH.set(retransEnv, 0L, retransformerEnv);
-            ENV_AGENT_VH.set(retransEnv, 0L, agentPtr);
-            ENV_RETRANS_VH.set(retransEnv, 0L, true);
+            mJVMTIEnv.set(agentMRetransformEnvironment, 0L, retransformerEnv);
+            mAgent.set(agentMRetransformEnvironment, 0L, agentPtr);
+            mIsRetransformer.set(agentMRetransformEnvironment, 0L, true);
 
-            setEnvironmentLocalStorageResult = (int) setEnvironmentLocalStorageHandle.invokeExact(retransformerEnv, retransEnv);
-            if (setEnvironmentLocalStorageResult != JVMTI_ERROR_NONE) {
-                System.err.println("SetEnvironmentLocalStorage 操作失敗: " + JNIConstants.getJvmtiErrorMessage(setEnvironmentLocalStorageResult));
-            }
+            setEnvironmentLocalStorageHandle(retransformerEnv, retransformerEnvVtable, agentMRetransformEnvironment);
 
             addCap(arena, getCapabilitiesHandle, addCapabilitiesHandle, jvmTiEnv, capabilities ->
                     setBit(capabilities, Offsets.CAN_SET_NATIVE_METHOD_PREFIX, true)
@@ -168,7 +275,7 @@ public final class PanamaPureMemoryAgent {
                     setBit(capabilities, Offsets.CAN_SET_NATIVE_METHOD_PREFIX, true)
             );
 
-            AGENT_NATIVE_PREFIX_ADDED_VH.set(agentPtr, 0L, true);
+            mNativeMethodPrefixAdded.set(agentPtr, 0L, true);
 
             // I don't know why cannot activate this cap
 //            addCap(arena, getCapabilitiesHandle, addCapabilitiesHandle, jvmTiEnv, capabilities ->
@@ -238,16 +345,15 @@ public final class PanamaPureMemoryAgent {
     }
 
     private static MemorySegment createJvmTiEnv(@NotNull Arena arena, @NotNull MethodHandle getEnvHandle, MemorySegment javaVM) throws Throwable {
-        // pEnv is void!!!!
         MemorySegment pEnv = arena.allocate(ADDRESS);
         int getJvmTiEnvResult = (int) getEnvHandle.invokeExact(javaVM, pEnv, JVMTI_VERSION_1_1);
         if (getJvmTiEnvResult != JNIConstants.JNI_OK) {
             System.err.println("GetEnv(getJvmTiEnv) 操作失敗: " + JNIConstants.getStatusMessage(getJvmTiEnvResult));
         }
-        return pEnv.get(ADDRESS, 0).reinterpret(1024);
+        return pEnv.get(ADDRESS, 0).reinterpret(ADDRESS.byteSize());
     }
 
-    private static void addCap(@NotNull Arena arena, @NotNull MethodHandle getCapabilitiesHandle, MethodHandle addCapabilitiesHandle, MemorySegment jvmTiEnv, Consumer<MemorySegment> adder) throws Throwable {
+    private static int addCap(@NotNull Arena arena, @NotNull MethodHandle getCapabilitiesHandle, MethodHandle addCapabilitiesHandle, MemorySegment jvmTiEnv, Consumer<MemorySegment> adder) throws Throwable {
         MemorySegment capabilities = arena.allocate(JVMTI_CAPABILITIES_LAYOUT);
         capabilities.fill((byte) 0);
         int getCapabilitiesResult = (int) getCapabilitiesHandle.invokeExact(jvmTiEnv, capabilities);
@@ -257,10 +363,7 @@ public final class PanamaPureMemoryAgent {
 
         adder.accept(capabilities);
 
-        int addCapabilitiesResult = (int) addCapabilitiesHandle.invokeExact(jvmTiEnv, capabilities);
-        if (addCapabilitiesResult != JVMTI_ERROR_NONE) {
-            System.err.println("AddCapabilities 操作失敗: " + JNIConstants.getJvmtiErrorMessage(addCapabilitiesResult));
-        }
+        return (int) addCapabilitiesHandle.invokeExact(jvmTiEnv, capabilities);
     }
 
     private static @NotNull Path getJvmPath(@NotNull String os) {

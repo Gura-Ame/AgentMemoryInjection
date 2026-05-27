@@ -11,6 +11,21 @@ import static java.lang.foreign.ValueLayout.*;
 
 // jdk25
 public class JPLISLayouts {
+    // === JVMTI Phase Constants (enum jvmtiPhase) ===
+    public static final int JVMTI_PHASE_ONLOAD = 1;
+    public static final int JVMTI_PHASE_PRIMORDIAL = 2;
+    public static final int JVMTI_PHASE_START = 6;
+    public static final int JVMTI_PHASE_LIVE = 4;
+    public static final int JVMTI_PHASE_DEAD = 8;
+
+    /**
+     * jvmtiPhase Layout
+     * C enum maps to a 32-bit signed integer (JAVA_INT) on most standard platforms.
+     */
+    public static final ValueLayout JVMTI_PHASE_LAYOUT = JAVA_INT.withName("jvmtiPhase");
+
+    // ===============================================
+
     public static final GroupLayout JVMTI_CAPABILITIES_LAYOUT = MemoryLayout.structLayout(
             MemoryLayout.sequenceLayout(8, JAVA_INT).withName("bits") // 用陣列處理 1 bit 欄位
     ).withName("jvmtiCapabilities");
