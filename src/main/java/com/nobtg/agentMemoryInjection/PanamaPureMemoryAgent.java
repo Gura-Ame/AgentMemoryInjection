@@ -234,6 +234,10 @@ public final class PanamaPureMemoryAgent {
                 setBit(capabilities, Offsets.CAN_SET_NATIVE_METHOD_PREFIX, true);
             });
 
+            // BE VERY CAREFUL ABOUT THIS CLASSLOADING PROBLEM
+            // If you don't init this, it "MAY" crash accidentally.
+            inHook.set(false); // 強制初始化，hook 啟動前就建立好 ThreadLocal entry
+
             MethodHandle hookHandle = MethodHandles.lookup().findStatic(
                     PanamaPureMemoryAgent.class, "eventHandlerClassFileLoadHook",
                     MethodType.methodType(void.class, MemorySegment.class, MemorySegment.class,
@@ -322,6 +326,13 @@ public final class PanamaPureMemoryAgent {
         return jvmTiVtableBase.reinterpret(vtableSize);
     }
 
+    private static final ThreadLocal<Boolean> inHook = ThreadLocal.withInitial(() -> false);
+
+    // NOT com.nobtg.SomeClass
+    // IS com/nobtg/SomeClass
+    // WARNING: If you modify the codes which are outside the try-catch block, YOU SHOULD BE VERY CAREFUL
+    // Because it WON'T print or dump anything even JVM crashed.
+    // You NEVER know what causes the crash.
     public static void eventHandlerClassFileLoadHook(
             MemorySegment jvmtiEnv,
             MemorySegment jniEnv,
@@ -333,6 +344,23 @@ public final class PanamaPureMemoryAgent {
             MemorySegment classData,
             MemorySegment newClassDataLenPtr,
             MemorySegment newClassDataPtr) {
+
+        // 先擋遞迴，不依賴任何可能觸發 class loading 的操作
+        if (inHook.get()) return;
+
+        inHook.set(true);
+        try {
+            if (name.equals(MemorySegment.NULL)) return;
+
+            // reinterpret 給夠大的範圍讓 getString 找到 null terminator
+            String className = name.reinterpret(Long.MAX_VALUE).getString(0);
+
+            System.out.println("hook: " + className);
+        } catch (Throwable t) {
+            t.printStackTrace();
+        } finally {
+            inHook.set(false);
+        }
     }
 
     private static MethodHandle findMethod(@NotNull GroupLayout layout, String name, @NotNull MemorySegment vtable, FunctionDescriptor descriptor) {
