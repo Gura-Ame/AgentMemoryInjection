@@ -11,13 +11,19 @@ import org.objectweb.asm.tree.MethodNode;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.instrument.ClassDefinition;
+import java.lang.instrument.ClassFileTransformer;
+import java.lang.instrument.IllegalClassFormatException;
+import java.security.ProtectionDomain;
 import java.util.function.Consumer;
 
 public class Main {
     public static void main(String[] args) {
         new Test().print();
         try {
+            long start = System.currentTimeMillis();
             PanamaPureMemoryAgent.performInjection();
+            long end = System.currentTimeMillis();
+            System.out.println(end - start);
 
             Consumer<ClassNode> changer = classNode -> {
                 for (MethodNode method : classNode.methods) {
@@ -32,9 +38,18 @@ public class Main {
                 }
             };
 
+            long start1 = System.currentTimeMillis();
             PanamaPureMemoryAgent.instrumentation.redefineClasses(
                     new ClassDefinition(Test.class, modifyClass(getBytesFromClass(Test.class), changer))
             );
+            long end1 = System.currentTimeMillis();
+            System.out.println(end1 - start1);
+            PanamaPureMemoryAgent.instrumentation.addTransformer(new ClassFileTransformer() {
+                @Override
+                public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined, ProtectionDomain protectionDomain, byte[] classfileBuffer) throws IllegalClassFormatException {
+                    return ClassFileTransformer.super.transform(loader, className, classBeingRedefined, protectionDomain, classfileBuffer);
+                }
+            }, true);
         } catch (Throwable e) {
             throw new RuntimeException(e);
         }

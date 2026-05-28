@@ -3,24 +3,48 @@ package com.nobtg.agentMemoryInjection.jvm;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 
-import java.lang.foreign.FunctionDescriptor;
-
-import static java.lang.foreign.ValueLayout.ADDRESS;
-import static java.lang.foreign.ValueLayout.JAVA_INT;
-
 public class JNIConstants {
-    public static final FunctionDescriptor CLASS_FILE_LOAD_HOOK_DESCRIPTOR = FunctionDescriptor.ofVoid(
-            ADDRESS, // jvmtiEnv*
-            ADDRESS, // JNIEnv*
-            ADDRESS, // jclass class_being_redefined
-            ADDRESS, // jobject loader
-            ADDRESS, // const char* name
-            ADDRESS, // jobject protection_domain
-            JAVA_INT,// jint class_data_len
-            ADDRESS, // const unsigned char* class_data
-            ADDRESS, // jint* new_class_data_len
-            ADDRESS  // unsigned char** new_class_data
-    );
+    // === JVMTI 事件模式 (jvmtiEventMode) ===
+    public static final int JVMTI_DISABLE = 0;
+    public static final int JVMTI_ENABLE = 1;
+
+    // === JVMTI 事件類型 (jvmtiEvent) ===
+    public static final int JVMTI_MIN_EVENT_TYPE_VAL = 50;
+    public static final int JVMTI_EVENT_VM_INIT = 50;
+    public static final int JVMTI_EVENT_VM_DEATH = 51;
+    public static final int JVMTI_EVENT_THREAD_START = 52;
+    public static final int JVMTI_EVENT_THREAD_END = 53;
+    public static final int JVMTI_EVENT_CLASS_FILE_LOAD_HOOK = 54;
+    public static final int JVMTI_EVENT_CLASS_LOAD = 55;
+    public static final int JVMTI_EVENT_CLASS_PREPARE = 56;
+    public static final int JVMTI_EVENT_VM_START = 57;
+    public static final int JVMTI_EVENT_EXCEPTION = 58;
+    public static final int JVMTI_EVENT_EXCEPTION_CATCH = 59;
+    public static final int JVMTI_EVENT_SINGLE_STEP = 60;
+    public static final int JVMTI_EVENT_FRAME_POP = 61;
+    public static final int JVMTI_EVENT_BREAKPOINT = 62;
+    public static final int JVMTI_EVENT_FIELD_ACCESS = 63;
+    public static final int JVMTI_EVENT_FIELD_MODIFICATION = 64;
+    public static final int JVMTI_EVENT_METHOD_ENTRY = 65;
+    public static final int JVMTI_EVENT_METHOD_EXIT = 66;
+    public static final int JVMTI_EVENT_NATIVE_METHOD_BIND = 67;
+    public static final int JVMTI_EVENT_COMPILED_METHOD_LOAD = 68;
+    public static final int JVMTI_EVENT_COMPILED_METHOD_UNLOAD = 69;
+    public static final int JVMTI_EVENT_DYNAMIC_CODE_GENERATED = 70;
+    public static final int JVMTI_EVENT_DATA_DUMP_REQUEST = 71;
+    public static final int JVMTI_EVENT_MONITOR_WAIT = 73;
+    public static final int JVMTI_EVENT_MONITOR_WAITED = 74;
+    public static final int JVMTI_EVENT_MONITOR_CONTENDED_ENTER = 75;
+    public static final int JVMTI_EVENT_MONITOR_CONTENDED_ENTERED = 76;
+    public static final int JVMTI_EVENT_RESOURCE_EXHAUSTED = 80;
+    public static final int JVMTI_EVENT_GARBAGE_COLLECTION_START = 81;
+    public static final int JVMTI_EVENT_GARBAGE_COLLECTION_FINISH = 82;
+    public static final int JVMTI_EVENT_OBJECT_FREE = 83;
+    public static final int JVMTI_EVENT_VM_OBJECT_ALLOC = 84;
+    public static final int JVMTI_EVENT_SAMPLED_OBJECT_ALLOC = 86;
+    public static final int JVMTI_EVENT_VIRTUAL_THREAD_START = 87;
+    public static final int JVMTI_EVENT_VIRTUAL_THREAD_END = 88;
+    public static final int JVMTI_MAX_EVENT_TYPE_VAL = 88;
 
     // === JNI 布林值 ===
     public static final int JNI_FALSE = 0;
